@@ -14,6 +14,8 @@ import {
 } from '../../services/excelService';
 import { generateDailyAttendancePDF } from '../../services/pdfReportGenerator';
 import { SchoolLogo } from '../common/SchoolLogo';
+import { useAuth } from '../../context/AuthContext';
+import { getTeacherAuthHeaders } from '../../utils/authHeaders';
 import {
   ClipboardCheck,
   Calendar,
@@ -50,6 +52,7 @@ export const AttendanceRegisterView: React.FC<AttendanceRegisterViewProps> = ({
   currentTeacherName,
   onRefresh,
 }) => {
+  const { teacherToken } = useAuth();
   // Nairobi local date
   const nairobiToday = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Africa/Nairobi',
@@ -309,9 +312,10 @@ export const AttendanceRegisterView: React.FC<AttendanceRegisterViewProps> = ({
     setUploadSubmitting(true);
     setUploadError(null);
     try {
+      const headers = await getTeacherAuthHeaders(teacherToken);
       const res = await fetch('/api/attendance/bulk-upload', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           cohortId: uploadCohortId || undefined,
           entries: validRows,

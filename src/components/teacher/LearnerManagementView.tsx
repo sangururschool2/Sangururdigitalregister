@@ -15,6 +15,7 @@ import {
   generateSingleLoginSlipPDF,
 } from '../../services/pdfReportGenerator';
 import { useAuth } from '../../context/AuthContext';
+import { getTeacherAuthHeaders } from '../../utils/authHeaders';
 import { SchoolLogo } from '../common/SchoolLogo';
 import { DigitalIdCardModal } from '../common/DigitalIdCardModal';
 import {
@@ -81,7 +82,7 @@ export const LearnerManagementView: React.FC<LearnerManagementViewProps> = ({
   const [bulkSuccessMessage, setBulkSuccessMessage] = useState<string | null>(null);
   const [bulkCreatedLearners, setBulkCreatedLearners] = useState<Learner[]>([]);
 
-  const { teacherProfile } = useAuth();
+  const { teacherProfile, teacherToken } = useAuth();
 
   // Password Reset Confirmation & Success Modals
   const [actionError, setActionError] = useState<string | null>(null);
@@ -150,9 +151,10 @@ export const LearnerManagementView: React.FC<LearnerManagementViewProps> = ({
     setSingleError(null);
 
     try {
+      const headers = await getTeacherAuthHeaders(teacherToken);
       const res = await fetch('/api/learners/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           fullName: singleName,
           schoolName: singleSchoolName.trim() || 'Sangurur Comprehensive School',
@@ -250,9 +252,10 @@ export const LearnerManagementView: React.FC<LearnerManagementViewProps> = ({
     setBulkError(null);
 
     try {
+      const headers = await getTeacherAuthHeaders(teacherToken);
       const res = await fetch('/api/learners/bulk-import', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           cohortId: bulkCohortId,
           learners: validRows,
@@ -289,9 +292,10 @@ export const LearnerManagementView: React.FC<LearnerManagementViewProps> = ({
     setResettingId(learner.id);
     setActionError(null);
     try {
+      const headers = await getTeacherAuthHeaders(teacherToken);
       const res = await fetch('/api/learners/reset-password', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           learnerId: learner.id,
           teacherId: teacherProfile?.uid || 'teacher_staff',
