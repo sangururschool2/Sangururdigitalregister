@@ -18,6 +18,17 @@ import {
   runTransaction,
   Firestore,
 } from 'firebase/firestore';
+import {
+  initializeApp as initializeAdminApp,
+  getApps as getAdminApps,
+  cert,
+  App as AdminApp,
+} from 'firebase-admin/app';
+import {
+  getFirestore as getAdminFirestore,
+  Firestore as AdminFirestore,
+} from 'firebase-admin/firestore';
+import { getAuth as getAdminAuth, Auth as AdminAuth } from 'firebase-admin/auth';
 
 dotenv.config();
 
@@ -53,7 +64,7 @@ function loadFirebaseConfig(): FirebaseWebConfig {
     }
   }
 
-  const config: FirebaseWebConfig = {
+  return {
     projectId:
       process.env.FIREBASE_PROJECT_ID ||
       process.env.VITE_FIREBASE_PROJECT_ID ||
@@ -90,8 +101,6 @@ function loadFirebaseConfig(): FirebaseWebConfig {
       fileConfig.messagingSenderId ||
       '',
   };
-
-  return config;
 }
 
 const firebaseConfig = loadFirebaseConfig();
@@ -104,7 +113,7 @@ const SESSION_SECRET = (() => {
   }
   if (process.env.NODE_ENV === 'production' || process.env.NETLIFY === 'true') {
     console.warn(
-      'SDLR Security Notice: SESSION_SECRET env var is not configured. Using deterministic project-scoped fallback; configure SESSION_SECRET in Netlify Environment variables.'
+      'SDLR Security Notice: SESSION_SECRET env var is not configured. Configure SESSION_SECRET in Netlify Environment variables.'
     );
   }
   return crypto
@@ -147,6 +156,213 @@ interface AuthenticatedTeacherRequest extends Request {
     fullName: string;
     role: 'teacher' | 'admin' | 'super_admin';
     email?: string;
+  };
+}
+
+// Unified Admin / Client Firestore Adapter
+interface DocSnapshotLike {
+  exists: boolean;
+  id: string;
+  data: () => Record<string, any> | undefined;
+}
+
+interface ServerDbAdapter {
+  mode: 'admin' | 'client';
+  getDoc: (colName: string, docId: string) => Promise<DocSnapshotLike>;
+  setDoc: (colName: string, docId: string, data: Record<string, any>) => Promise<void>;
+  updateDoc: (colName: string, docId: string, data: Record<string, any>) => Promise<void>;
+  getCollectionDocs: (colName: string) => Promise<Array<{ id: string; data: () => Record<string, any> }>>;
+  queryWhere: (
+    colName: string,
+    filters: Array<[string, '==' | 'array-contains', any]>
+  ) => Promise<Array<{ id: string; data: () => Record<string, any> }>>;
+  runTransaction: <T>(
+    fn: (tx: {
+      get: (colName: string, docId: string) => Promise<DocSnapshotLike>;
+      set: (colName: string, docId: string, data: Record<string, any>) => void;
+    }) => Promise<T>
+  ) => Promise<T>;
+}
+
+let cachedAdminApp: AdminApp | null = null;
+let cachedAdminDb: AdminFirestore | null = null;
+let cachedAdminAuth: AdminAuth | null = null;
+let cachedClientDb: Firestore | null = null;
+
+function initAdminServices(): { adminDb: AdminFirestore; adminAuth: AdminAuth } | null {
+  if (cachedAdminDb && cachedAdminAuth) {
+    return { adminDb: cachedAdminDb, adminAuth: cachedAdminAuth };
+  }
+
+  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+  if (!rawJson) return null;
+
+  try {
+    const parsed = JSON.parse(rawJson);
+    if (typeof parsed.private_key === 'string') {
+      parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+    }
+
+    const existing = getAdminApps().find((a) => a.name === 'SDLR_ADMIN_APP');
+    cachedAdminApp =
+      existing ||
+      initializeAdminApp(
+        {
+          credential: cert(parsed),
+          projectId: firebaseConfig.projectId || parsed.project_id,
+          storageBucket: firebaseConfig.storageBucket,
+        },
+        'SDLR_ADMIN_APP'
+      );
+
+    cachedAdminDb = getAdminFirestore(cachedAdminApp, firebaseConfig.firestoreDatabaseId);
+    cachedAdminAuth = getAdminAuth(cachedAdminApp);
+    return { adminDb: cachedAdminDb, adminAuth: cachedAdminAuth };
+  } catch (err) {
+    console.error('Could not initialize Firebase Admin SDK from FIREBASE_SERVICE_ACCOUNT_JSON:', err);
+    return null;
+  }
+}
+
+function getClientDb(): Firestore | null {
+  if (cachedClientDb) return cachedClientDb;
+  if (!firebaseConfig.projectId || !firebaseConfig.apiKey) {
+    console.warn('Could not initialize server Firestore: missing Firebase configuration');
+    return null;
+  }
+  try {
+    const existingApp = getApps().find((a: FirebaseApp) => a.name === 'SERVER_APP') || getApps()[0];
+    const fbApp = existingApp || initializeApp(firebaseConfig, 'SERVER_APP');
+    cachedClientDb = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId);
+    return cachedClientDb;
+  } catch (e) {
+    console.warn('Could not initialize server Firestore from config:', e);
+    return null;
+  }
+}
+
+function getServerDbAdapter(): { db: ServerDbAdapter | null; adminAuth: AdminAuth | null } {
+  const adminServices = initAdminServices();
+  if (adminServices) {
+    const { adminDb, adminAuth } = adminServices;
+    const adapter: ServerDbAdapter = {
+      mode: 'admin',
+      async getDoc(colName, docId) {
+        const snap = await adminDb.collection(colName).doc(docId).get();
+        return {
+          exists: snap.exists,
+          id: snap.id,
+          data: () => snap.data(),
+        };
+      },
+      async setDoc(colName, docId, data) {
+        await adminDb.collection(colName).doc(docId).set(data);
+      },
+      async updateDoc(colName, docId, data) {
+        await adminDb.collection(colName).doc(docId).update(data);
+      },
+      async getCollectionDocs(colName) {
+        const snap = await adminDb.collection(colName).get();
+        return snap.docs.map((d) => ({ id: d.id, data: () => d.data() }));
+      },
+      async queryWhere(colName, filters) {
+        let q: FirebaseFirestore.Query = adminDb.collection(colName);
+        for (const [field, op, val] of filters) {
+          q = q.where(field, op, val);
+        }
+        const snap = await q.get();
+        return snap.docs.map((d) => ({ id: d.id, data: () => d.data() }));
+      },
+      async runTransaction(fn) {
+        return adminDb.runTransaction(async (tx) => {
+          const wrappedTx = {
+            async get(colName: string, docId: string): Promise<DocSnapshotLike> {
+              const snap = await tx.get(adminDb.collection(colName).doc(docId));
+              return { exists: snap.exists, id: snap.id, data: () => snap.data() };
+            },
+            set(colName: string, docId: string, data: Record<string, any>) {
+              tx.set(adminDb.collection(colName).doc(docId), data);
+            },
+          };
+          return fn(wrappedTx);
+        });
+      },
+    };
+    return { db: adapter, adminAuth };
+  }
+
+  const clientDb = getClientDb();
+  if (!clientDb) return { db: null, adminAuth: null };
+
+  const adapter: ServerDbAdapter = {
+    mode: 'client',
+    async getDoc(colName, docId) {
+      const snap = await getDoc(doc(clientDb, colName, docId));
+      return {
+        exists: snap.exists(),
+        id: snap.id,
+        data: () => snap.data(),
+      };
+    },
+    async setDoc(colName, docId, data) {
+      await setDoc(doc(clientDb, colName, docId), data);
+    },
+    async updateDoc(colName, docId, data) {
+      await updateDoc(doc(clientDb, colName, docId), data);
+    },
+    async getCollectionDocs(colName) {
+      const snap = await getDocs(collection(clientDb, colName));
+      return snap.docs.map((d) => ({ id: d.id, data: () => d.data() }));
+    },
+    async queryWhere(colName, filters) {
+      let q: any = collection(clientDb, colName);
+      for (const [field, op, val] of filters) {
+        q = query(q, where(field, op, val));
+      }
+      const snap = await getDocs(q);
+      return snap.docs.map((d: any) => ({ id: d.id, data: () => d.data() }));
+    },
+    async runTransaction(fn) {
+      return runTransaction(clientDb, async (tx) => {
+        const wrappedTx = {
+          async get(colName: string, docId: string): Promise<DocSnapshotLike> {
+            const snap = await tx.get(doc(clientDb, colName, docId));
+            return { exists: snap.exists(), id: snap.id, data: () => snap.data() };
+          },
+          set(colName: string, docId: string, data: Record<string, any>) {
+            tx.set(doc(clientDb, colName, docId), data);
+          },
+        };
+        return fn(wrappedTx);
+      });
+    },
+  };
+  return { db: adapter, adminAuth: null };
+}
+
+function formatServerFirestoreError(err: any, db: ServerDbAdapter | null, fallbackMsg: string): { status: number; message: string } {
+  const msg = String(err?.message || err || '');
+  const code = String(err?.code || '');
+  if (
+    code === 'permission-denied' ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('Missing or insufficient permissions')
+  ) {
+    if (db?.mode !== 'admin') {
+      return {
+        status: 503,
+        message:
+          'Server Firestore access was denied by security rules. Configure FIREBASE_SERVICE_ACCOUNT_JSON in Netlify Environment Variables (or sign in with Google Staff Account).',
+      };
+    }
+    return {
+      status: 403,
+      message: 'Firestore security rules denied this server operation.',
+    };
+  }
+  return {
+    status: 500,
+    message: msg || fallbackMsg,
   };
 }
 
@@ -231,11 +447,27 @@ function verifyTeacherSessionToken(token: string): TeacherSessionPayload | null 
   }
 }
 
-// Verify Firebase Auth ID tokens server-side against Identity Toolkit
+// Verify Firebase Auth ID tokens server-side (via Admin SDK if available, else Identity Toolkit)
 async function verifyFirebaseIdToken(
-  idToken: string
+  idToken: string,
+  adminAuth: AdminAuth | null
 ): Promise<{ uid: string; email: string; emailVerified: boolean; displayName?: string } | null> {
-  if (!firebaseConfig.apiKey || !idToken) return null;
+  if (!idToken) return null;
+  if (adminAuth) {
+    try {
+      const decoded = await adminAuth.verifyIdToken(idToken);
+      return {
+        uid: decoded.uid,
+        email: decoded.email || '',
+        emailVerified: Boolean(decoded.email_verified || decoded.firebase?.sign_in_provider === 'custom'),
+        displayName: decoded.name,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  if (!firebaseConfig.apiKey) return null;
   try {
     const response = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
@@ -268,24 +500,6 @@ async function verifyFirebaseIdToken(
   }
 }
 
-let cachedDb: Firestore | null = null;
-function getServerDb(): Firestore | null {
-  if (cachedDb) return cachedDb;
-  if (!firebaseConfig.projectId || !firebaseConfig.apiKey) {
-    console.warn('Could not initialize server Firestore: missing Firebase configuration');
-    return null;
-  }
-  try {
-    const existingApp = getApps().find((a: FirebaseApp) => a.name === 'SERVER_APP') || getApps()[0];
-    const fbApp = existingApp || initializeApp(firebaseConfig, 'SERVER_APP');
-    cachedDb = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId);
-    return cachedDb;
-  } catch (e) {
-    console.warn('Could not initialize server Firestore from config:', e);
-    return null;
-  }
-}
-
 function generateSalt(): string {
   return crypto.randomBytes(16).toString('hex');
 }
@@ -311,7 +525,7 @@ function getNairobiDateString(): string {
 let defaultTeacherEnsured = false;
 let defaultTeacherBootstrapPromise: Promise<void> | null = null;
 
-async function ensureDefaultTeacherAccount(db: Firestore | null): Promise<void> {
+async function ensureDefaultTeacherAccount(db: ServerDbAdapter | null): Promise<void> {
   if (!db || defaultTeacherEnsured) return;
   if (defaultTeacherBootstrapPromise) return defaultTeacherBootstrapPromise;
 
@@ -320,10 +534,9 @@ async function ensureDefaultTeacherAccount(db: Firestore | null): Promise<void> 
   defaultTeacherBootstrapPromise = (async () => {
     try {
       const now = new Date().toISOString();
-      const teacherRef = doc(db, 'teachers', DEFAULT_TEACHER_UID);
-      const teacherSnap = await getDoc(teacherRef);
-      if (!teacherSnap.exists()) {
-        await setDoc(teacherRef, {
+      const teacherSnap = await db.getDoc('teachers', DEFAULT_TEACHER_UID);
+      if (!teacherSnap.exists) {
+        await db.setDoc('teachers', DEFAULT_TEACHER_UID, {
           uid: DEFAULT_TEACHER_UID,
           username: DEFAULT_TEACHER_USERNAME,
           email: 'teacher@sangururschool.edu.ke',
@@ -335,12 +548,11 @@ async function ensureDefaultTeacherAccount(db: Firestore | null): Promise<void> 
         });
       }
 
-      const credRef = doc(db, 'teacherCredentials', DEFAULT_TEACHER_UID);
-      const credSnap = await getDoc(credRef);
-      if (!credSnap.exists()) {
+      const credSnap = await db.getDoc('teacherCredentials', DEFAULT_TEACHER_UID);
+      if (!credSnap.exists) {
         const salt = generateSalt();
         const passwordHash = hashPassword(initialTeacherPassword, salt);
-        await setDoc(credRef, {
+        await db.setDoc('teacherCredentials', DEFAULT_TEACHER_UID, {
           id: DEFAULT_TEACHER_UID,
           username: DEFAULT_TEACHER_USERNAME,
           teacherUid: DEFAULT_TEACHER_UID,
@@ -362,18 +574,16 @@ async function ensureDefaultTeacherAccount(db: Firestore | null): Promise<void> 
   return defaultTeacherBootstrapPromise;
 }
 
-async function allocateDigitalIds(db: Firestore | null, count: number): Promise<string[]> {
+async function allocateDigitalIds(db: ServerDbAdapter | null, count: number): Promise<string[]> {
   if (!db) {
     return Array.from({ length: count }, (_, idx) => `SG-LRN-2026-${String(idx + 1).padStart(3, '0')}`);
   }
 
-  const counterRef = doc(db, 'counters', 'learner_digital_id_2026');
-
   let bootstrapMax = 0;
-  const preSnap = await getDoc(counterRef);
-  if (!preSnap.exists()) {
-    const learnersSnap = await getDocs(collection(db, 'learners'));
-    learnersSnap.forEach((d: any) => {
+  const preSnap = await db.getDoc('counters', 'learner_digital_id_2026');
+  if (!preSnap.exists) {
+    const learnersDocs = await db.getCollectionDocs('learners');
+    learnersDocs.forEach((d) => {
       const data = d.data();
       const idStr = String(data.digitalId || data.learnerId || data.username || '');
       const match = idStr.match(/^SG-LRN-2026-(\d+)$/i) || idStr.match(/(\d+)$/);
@@ -386,13 +596,14 @@ async function allocateDigitalIds(db: Firestore | null, count: number): Promise<
     });
   }
 
-  const startSeq = await runTransaction(db, async (transaction) => {
-    const counterDoc = await transaction.get(counterRef);
-    const currentSeq = counterDoc.exists()
-      ? Math.max(Number(counterDoc.data().lastSeq) || 0, bootstrapMax)
+  const startSeq = await db.runTransaction(async (tx) => {
+    const counterDoc = await tx.get('counters', 'learner_digital_id_2026');
+    const existingData = counterDoc.data();
+    const currentSeq = counterDoc.exists
+      ? Math.max(Number(existingData?.lastSeq) || 0, bootstrapMax)
       : bootstrapMax;
     const nextLast = currentSeq + count;
-    transaction.set(counterRef, {
+    tx.set('counters', 'learner_digital_id_2026', {
       lastSeq: nextLast,
       updatedAt: new Date().toISOString(),
     });
@@ -403,7 +614,7 @@ async function allocateDigitalIds(db: Firestore | null, count: number): Promise<
 }
 
 async function writeAuditLog(
-  db: Firestore | null,
+  db: ServerDbAdapter | null,
   entry: {
     actorId: string;
     actorName: string;
@@ -417,7 +628,7 @@ async function writeAuditLog(
   if (!db) return;
   try {
     const logId = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    await setDoc(doc(db, 'auditLogs', logId), {
+    await db.setDoc('auditLogs', logId, {
       id: logId,
       ...entry,
       timestamp: new Date().toISOString(),
@@ -429,7 +640,7 @@ async function writeAuditLog(
 
 export function createApiApp(): Express {
   const app = express();
-  const db = getServerDb();
+  const { db, adminAuth } = getServerDbAdapter();
 
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '4mb' }));
@@ -457,11 +668,11 @@ export function createApiApp(): Express {
       if (!db) {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
-      const snap = await getDoc(doc(db, 'learners', payload.sub));
-      if (!snap.exists()) {
+      const snap = await db.getDoc('learners', payload.sub);
+      if (!snap.exists) {
         return res.status(401).json({ error: 'Learner account no longer exists.' });
       }
-      const data = snap.data();
+      const data = snap.data() || {};
       if (data.status === 'INACTIVE' || data.active === false) {
         return res.status(403).json({ error: 'Learner account is inactive. Please contact your school administrator.' });
       }
@@ -482,7 +693,8 @@ export function createApiApp(): Express {
       };
       next();
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Session validation error' });
+      const formatted = formatServerFirestoreError(err, db, 'Session validation error');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   }
 
@@ -497,14 +709,13 @@ export function createApiApp(): Express {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
 
-      // 1. Check staff username/password HMAC token
       const staffPayload = verifyTeacherSessionToken(token);
       if (staffPayload) {
-        const teacherSnap = await getDoc(doc(db, 'teachers', staffPayload.sub));
-        if (!teacherSnap.exists()) {
+        const teacherSnap = await db.getDoc('teachers', staffPayload.sub);
+        if (!teacherSnap.exists) {
           return res.status(401).json({ error: 'Teacher account no longer exists.' });
         }
-        const teacherData = teacherSnap.data();
+        const teacherData = teacherSnap.data() || {};
         if (teacherData.active === false) {
           return res.status(403).json({ error: 'Teacher account is inactive.' });
         }
@@ -517,20 +728,19 @@ export function createApiApp(): Express {
         return next();
       }
 
-      // 2. Check Firebase Auth ID token (Google Staff Sign-In)
-      const fbUser = await verifyFirebaseIdToken(token);
+      const fbUser = await verifyFirebaseIdToken(token, adminAuth);
       if (!fbUser || !fbUser.emailVerified) {
         return res.status(401).json({ error: 'Staff session expired or invalid. Please sign in again.' });
       }
 
-      const teacherSnap = await getDoc(doc(db, 'teachers', fbUser.uid));
+      const teacherSnap = await db.getDoc('teachers', fbUser.uid);
       const isBootstrapAdmin = fbUser.email === BOOTSTRAP_ADMIN_EMAIL;
 
-      if (!teacherSnap.exists() && !isBootstrapAdmin) {
+      if (!teacherSnap.exists && !isBootstrapAdmin) {
         return res.status(403).json({ error: 'Access denied: staff teacher profile not authorized.' });
       }
 
-      const teacherData = teacherSnap.exists() ? teacherSnap.data() : null;
+      const teacherData = teacherSnap.exists ? teacherSnap.data() || null : null;
       if (teacherData && teacherData.active === false) {
         return res.status(403).json({ error: 'Teacher account is inactive. Please contact your school administrator.' });
       }
@@ -543,7 +753,8 @@ export function createApiApp(): Express {
       };
       return next();
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Staff authorization error' });
+      const formatted = formatServerFirestoreError(err, db, 'Staff authorization error');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   }
 
@@ -556,7 +767,11 @@ export function createApiApp(): Express {
       motto: 'THINK, CODE, CHANGE THE WORLD',
       timezone: 'Africa/Nairobi',
       serverTimeEAT: new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }),
+      projectId: firebaseConfig.projectId || null,
+      firestoreDatabaseId: firebaseConfig.firestoreDatabaseId || null,
+      storageBucket: firebaseConfig.storageBucket || null,
       firestoreConfigured: Boolean(db),
+      adminSdkActive: Boolean(adminAuth),
     });
   });
 
@@ -581,12 +796,12 @@ export function createApiApp(): Express {
           ? DEFAULT_TEACHER_UID
           : `teacher_${cleanUsername.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}`;
 
-      const credSnap = await getDoc(doc(db, 'teacherCredentials', credDocId));
-      if (!credSnap.exists()) {
+      const credSnap = await db.getDoc('teacherCredentials', credDocId);
+      if (!credSnap.exists) {
         return res.status(401).json({ error: 'Invalid teacher username or password.' });
       }
 
-      const credData = credSnap.data();
+      const credData = credSnap.data() || {};
       if (credData.active === false) {
         return res.status(403).json({ error: 'Teacher account is inactive. Please contact the school administrator.' });
       }
@@ -609,8 +824,8 @@ export function createApiApp(): Express {
       }
 
       const teacherUid = String(credData.teacherUid || DEFAULT_TEACHER_UID);
-      const teacherSnap = await getDoc(doc(db, 'teachers', teacherUid));
-      const teacherData = teacherSnap.exists() ? teacherSnap.data() : null;
+      const teacherSnap = await db.getDoc('teachers', teacherUid);
+      const teacherData = teacherSnap.exists ? teacherSnap.data() || null : null;
 
       if (teacherData && teacherData.active === false) {
         return res.status(403).json({ error: 'Teacher profile is inactive. Please contact the school administrator.' });
@@ -635,6 +850,19 @@ export function createApiApp(): Express {
 
       const { token, expiresAt } = createTeacherSessionToken(teacherUid, expectedUsername, teacherRole);
 
+      let firebaseCustomToken: string | undefined;
+      if (adminAuth) {
+        try {
+          firebaseCustomToken = await adminAuth.createCustomToken(teacherUid, {
+            role: teacherRole,
+            username: expectedUsername,
+            email_verified: true,
+          });
+        } catch (tokenErr) {
+          console.warn('Could not mint Firebase custom token for staff teacher:', tokenErr);
+        }
+      }
+
       await writeAuditLog(db, {
         actorId: teacherProfile.uid,
         actorName: teacherProfile.fullName,
@@ -649,11 +877,13 @@ export function createApiApp(): Express {
         success: true,
         teacher: teacherProfile,
         token,
+        firebaseCustomToken,
         expiresAt,
       });
     } catch (err: any) {
       console.error('Teacher login error:', err);
-      return res.status(500).json({ error: err.message || 'Internal teacher login error' });
+      const formatted = formatServerFirestoreError(err, db, 'Internal teacher login error');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -675,18 +905,32 @@ export function createApiApp(): Express {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
 
-      const teacherSnap = await getDoc(doc(db, 'teachers', payload.sub));
-      if (!teacherSnap.exists()) {
+      const teacherSnap = await db.getDoc('teachers', payload.sub);
+      if (!teacherSnap.exists) {
         return res.status(401).json({ error: 'Teacher account no longer exists.' });
       }
 
-      const teacherData = teacherSnap.data();
+      const teacherData = teacherSnap.data() || {};
       if (teacherData.active === false) {
         return res.status(403).json({ error: 'Teacher account is inactive.' });
       }
 
+      let firebaseCustomToken: string | undefined;
+      if (adminAuth) {
+        try {
+          firebaseCustomToken = await adminAuth.createCustomToken(teacherSnap.id, {
+            role: teacherData.role || 'teacher',
+            username: teacherData.username || payload.username,
+            email_verified: true,
+          });
+        } catch {
+          // ignore
+        }
+      }
+
       return res.json({
         success: true,
+        firebaseCustomToken,
         teacher: {
           uid: teacherSnap.id,
           username: teacherData.username || payload.username,
@@ -700,7 +944,8 @@ export function createApiApp(): Express {
         },
       });
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Teacher session validation error' });
+      const formatted = formatServerFirestoreError(err, db, 'Teacher session validation error');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -720,28 +965,27 @@ export function createApiApp(): Express {
       const cleanUsername = String(username).trim();
       const cleanUpper = cleanUsername.toUpperCase();
       const cleanLower = cleanUsername.toLowerCase();
-      const learnersRef = collection(db, 'learners');
 
-      let snap = await getDocs(query(learnersRef, where('username', '==', cleanUsername)));
-      if (snap.empty) {
-        snap = await getDocs(query(learnersRef, where('username', '==', cleanUpper)));
+      let matches = await db.queryWhere('learners', [['username', '==', cleanUsername]]);
+      if (matches.length === 0) {
+        matches = await db.queryWhere('learners', [['username', '==', cleanUpper]]);
       }
-      if (snap.empty) {
-        snap = await getDocs(query(learnersRef, where('username', '==', cleanLower)));
+      if (matches.length === 0) {
+        matches = await db.queryWhere('learners', [['username', '==', cleanLower]]);
       }
-      if (snap.empty) {
-        snap = await getDocs(query(learnersRef, where('digitalId', '==', cleanUpper)));
+      if (matches.length === 0) {
+        matches = await db.queryWhere('learners', [['digitalId', '==', cleanUpper]]);
       }
-      if (snap.empty) {
-        snap = await getDocs(query(learnersRef, where('learnerId', '==', cleanUpper)));
+      if (matches.length === 0) {
+        matches = await db.queryWhere('learners', [['learnerId', '==', cleanUpper]]);
       }
 
-      if (snap.empty) {
+      if (matches.length === 0) {
         return res.status(401).json({ error: 'Invalid Digital ID or password. Please verify with your teacher.' });
       }
 
-      const learnerDoc = snap.docs[0];
-      const learnerData = learnerDoc.data();
+      const learnerDoc = matches[0];
+      const learnerData = learnerDoc.data() || {};
 
       if (learnerData.status === 'INACTIVE' || learnerData.active === false) {
         return res.status(403).json({ error: 'Learner account is inactive. Please contact your school administrator.' });
@@ -785,16 +1029,31 @@ export function createApiApp(): Express {
 
       const { token, expiresAt } = createSessionToken(learnerDoc.id, digitalId);
 
+      let firebaseCustomToken: string | undefined;
+      if (adminAuth) {
+        try {
+          firebaseCustomToken = await adminAuth.createCustomToken(learnerDoc.id, {
+            role: 'learner',
+            digitalId,
+            email_verified: true,
+          });
+        } catch (tokenErr) {
+          console.warn('Could not mint Firebase custom token for learner:', tokenErr);
+        }
+      }
+
       return res.json({
         success: true,
         learner: learnerProfile,
         mustChangePassword,
         token,
+        firebaseCustomToken,
         expiresAt,
       });
     } catch (err: any) {
       console.error('Login error:', err);
-      return res.status(500).json({ error: err.message || 'Internal login error' });
+      const formatted = formatServerFirestoreError(err, db, 'Internal login error');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -849,7 +1108,7 @@ export function createApiApp(): Express {
       const newSalt = generateSalt();
       const newHash = hashPassword(newPassword, newSalt);
 
-      await updateDoc(doc(db, 'learners', authLearner.id), {
+      await db.updateDoc('learners', authLearner.id, {
         passwordHash: newHash,
         salt: newSalt,
         mustChangePassword: false,
@@ -874,7 +1133,8 @@ export function createApiApp(): Express {
       });
     } catch (err: any) {
       console.error('Password change error:', err);
-      return res.status(500).json({ error: err.message || 'Error updating password' });
+      const formatted = formatServerFirestoreError(err, db, 'Error updating password');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -888,13 +1148,14 @@ export function createApiApp(): Express {
       if (assignedIds.length === 0) {
         return res.json({ success: true, cohorts: [] });
       }
-      const snap = await getDocs(collection(db, 'cohorts'));
-      const cohorts = snap.docs
-        .map((d: any) => ({ ...d.data(), id: d.id }))
+      const docs = await db.getCollectionDocs('cohorts');
+      const cohorts = docs
+        .map((d) => ({ ...d.data(), id: d.id }))
         .filter((c: any) => assignedIds.includes(c.id) || assignedIds.includes(c.code));
       return res.json({ success: true, cohorts });
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Failed to load assigned cohorts' });
+      const formatted = formatServerFirestoreError(err, db, 'Failed to load assigned cohorts');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -909,8 +1170,8 @@ export function createApiApp(): Express {
       if (cohortId) {
         let isMember = assignedIds.includes(cohortId);
         if (!isMember) {
-          const cohortSnap = await getDoc(doc(db, 'cohorts', cohortId));
-          if (cohortSnap.exists()) {
+          const cohortSnap = await db.getDoc('cohorts', cohortId);
+          if (cohortSnap.exists) {
             const cohortCode = cohortSnap.data()?.code;
             if (cohortCode && assignedIds.includes(cohortCode)) {
               isMember = true;
@@ -922,17 +1183,21 @@ export function createApiApp(): Express {
         }
       }
 
-      let q = query(collection(db, 'dailyRegisters'), where('learnerDocId', '==', req.authLearner.id));
+      const filters: Array<[string, '==' | 'array-contains', any]> = [
+        ['learnerDocId', '==', req.authLearner.id],
+      ];
       if (cohortId) {
-        q = query(q, where('cohortId', '==', cohortId));
+        filters.push(['cohortId', '==', cohortId]);
       }
-      const snap = await getDocs(q);
-      const registers = snap.docs
-        .map((d: any) => ({ ...d.data(), id: d.id }))
+
+      const docs = await db.queryWhere('dailyRegisters', filters);
+      const registers = docs
+        .map((d) => ({ ...d.data(), id: d.id }))
         .sort((a: any, b: any) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
       return res.json({ success: true, registers });
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Failed to load learner registers' });
+      const formatted = formatServerFirestoreError(err, db, 'Failed to load learner registers');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -941,14 +1206,73 @@ export function createApiApp(): Express {
       if (!db) {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
-      const q = query(collection(db, 'teacherFeedback'), where('learnerDocId', '==', req.authLearner.id));
-      const snap = await getDocs(q);
-      const feedback = snap.docs
-        .map((d: any) => ({ ...d.data(), id: d.id }))
+      const docs = await db.queryWhere('teacherFeedback', [['learnerDocId', '==', req.authLearner.id]]);
+      const feedback = docs
+        .map((d) => ({ ...d.data(), id: d.id }))
         .sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
       return res.json({ success: true, feedback });
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Failed to load teacher feedback' });
+      const formatted = formatServerFirestoreError(err, db, 'Failed to load teacher feedback');
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  app.get('/api/learner/timetable', requireLearnerAuth, async (req: AuthenticatedLearnerRequest, res: Response) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: 'Database service unavailable' });
+      }
+      const cohortId = req.query.cohortId ? String(req.query.cohortId).trim() : '';
+      if (!cohortId) {
+        return res.status(400).json({ error: 'Cohort ID is required.' });
+      }
+
+      const assignedIds: string[] = req.authLearner.assignedCohortIds || [];
+      let isMember = assignedIds.includes(cohortId);
+      if (!isMember) {
+        const cohortSnap = await db.getDoc('cohorts', cohortId);
+        if (cohortSnap.exists && cohortSnap.data()?.code && assignedIds.includes(cohortSnap.data()?.code)) {
+          isMember = true;
+        }
+      }
+      if (!isMember) {
+        return res.status(403).json({ error: 'Access denied: you are not assigned to this cohort.' });
+      }
+
+      const docs = await db.queryWhere('weeklyTimetables', [['cohortId', '==', cohortId]]);
+      const entries = docs
+        .map((d) => ({ ...d.data(), id: d.id }))
+        .sort((a: any, b: any) => {
+          if (a.startDate !== b.startDate) return String(a.startDate || '').localeCompare(String(b.startDate || ''));
+          return (Number(a.weekNumber) || 0) - (Number(b.weekNumber) || 0);
+        });
+      return res.json({ success: true, entries });
+    } catch (err: any) {
+      const formatted = formatServerFirestoreError(err, db, 'Failed to load weekly timetable');
+      return res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
+
+  app.get('/api/learner/settings', requireLearnerAuth, async (_req: AuthenticatedLearnerRequest, res: Response) => {
+    const defaultSettings = {
+      id: 'school_config',
+      schoolName: 'Sangurur Comprehensive School',
+      schoolMotto: 'THINK, CODE, CHANGE THE WORLD',
+      timezone: 'Africa/Nairobi',
+      allowLearnerReflections: true,
+      lateCutoffTime: '08:30',
+      attendanceCutoffTime: '16:30',
+      contactEmail: 'sangururschool10@gmail.com',
+    };
+    try {
+      if (!db) return res.json({ success: true, settings: defaultSettings });
+      const snap = await db.getDoc('schoolSettings', 'school_config');
+      return res.json({
+        success: true,
+        settings: snap.exists ? { ...defaultSettings, ...snap.data() } : defaultSettings,
+      });
+    } catch {
+      return res.json({ success: true, settings: defaultSettings });
     }
   });
 
@@ -975,16 +1299,16 @@ export function createApiApp(): Express {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
 
-      const cohortSnap = await getDoc(doc(db, 'cohorts', String(cohortId)));
-      if (!cohortSnap.exists()) {
+      const cohortSnap = await db.getDoc('cohorts', String(cohortId));
+      if (!cohortSnap.exists) {
         return res.status(404).json({ error: 'Selected cohort was not found.' });
       }
 
       let digitalId = '';
       if (customDigitalId && String(customDigitalId).trim()) {
         digitalId = String(customDigitalId).trim().toUpperCase();
-        const dupSnap = await getDocs(query(collection(db, 'learners'), where('digitalId', '==', digitalId)));
-        if (!dupSnap.empty) {
+        const dupDocs = await db.queryWhere('learners', [['digitalId', '==', digitalId]]);
+        if (dupDocs.length > 0) {
           return res.status(409).json({ error: `Digital ID ${digitalId} is already assigned to another learner.` });
         }
       } else {
@@ -1028,10 +1352,10 @@ export function createApiApp(): Express {
         updatedAt: new Date().toISOString(),
       };
 
-      await setDoc(doc(db, 'learners', docId), newLearner);
+      await db.setDoc('learners', docId, newLearner);
 
       const memberId = `mem_${cohortId}_${docId}`;
-      await setDoc(doc(db, 'cohortMembers', memberId), {
+      await db.setDoc('cohortMembers', memberId, {
         id: memberId,
         cohortId,
         learnerId: docId,
@@ -1062,7 +1386,8 @@ export function createApiApp(): Express {
       });
     } catch (err: any) {
       console.error('Create learner error:', err);
-      return res.status(500).json({ error: err.message || 'Error creating learner' });
+      const formatted = formatServerFirestoreError(err, db, 'Error creating learner');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -1079,8 +1404,8 @@ export function createApiApp(): Express {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
 
-      const cohortSnap = await getDoc(doc(db, 'cohorts', String(cohortId)));
-      if (!cohortSnap.exists()) {
+      const cohortSnap = await db.getDoc('cohorts', String(cohortId));
+      if (!cohortSnap.exists) {
         return res.status(404).json({ error: 'Selected cohort was not found.' });
       }
 
@@ -1137,10 +1462,10 @@ export function createApiApp(): Express {
             updatedAt: new Date().toISOString(),
           };
 
-          await setDoc(doc(db, 'learners', docId), newLearner);
+          await db.setDoc('learners', docId, newLearner);
 
           const memberId = `mem_${cohortId}_${docId}`;
-          await setDoc(doc(db, 'cohortMembers', memberId), {
+          await db.setDoc('cohortMembers', memberId, {
             id: memberId,
             cohortId,
             learnerId: docId,
@@ -1179,7 +1504,8 @@ export function createApiApp(): Express {
       });
     } catch (err: any) {
       console.error('Bulk import error:', err);
-      return res.status(500).json({ error: err.message || 'Error processing bulk import' });
+      const formatted = formatServerFirestoreError(err, db, 'Error processing bulk import');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -1193,19 +1519,18 @@ export function createApiApp(): Express {
       const { learnerId } = req.body;
       if (!learnerId) return res.status(400).json({ error: 'Learner ID is required' });
 
-      const learnerRef = doc(db, 'learners', learnerId);
-      const snap = await getDoc(learnerRef);
+      const snap = await db.getDoc('learners', learnerId);
 
-      if (!snap.exists()) {
+      if (!snap.exists) {
         return res.status(404).json({ error: 'Learner account not found' });
       }
 
-      const learnerData = snap.data();
+      const learnerData = snap.data() || {};
 
       const salt = generateSalt();
       const passwordHash = hashPassword(DEFAULT_INITIAL_PASSWORD, salt);
 
-      await updateDoc(learnerRef, {
+      await db.updateDoc('learners', learnerId, {
         passwordHash,
         salt,
         mustChangePassword: true,
@@ -1233,7 +1558,8 @@ export function createApiApp(): Express {
         message: 'Password reset to default 123456789. Audit log entry recorded.',
       });
     } catch (err: any) {
-      return res.status(500).json({ error: err.message || 'Error resetting password' });
+      const formatted = formatServerFirestoreError(err, db, 'Error resetting password');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -1302,11 +1628,11 @@ export function createApiApp(): Express {
 
       const isPreviousDay = targetDate < nairobiToday;
 
-      const cohortSnap = await getDoc(doc(db, 'cohorts', String(cohortId)));
-      if (!cohortSnap.exists()) {
+      const cohortSnap = await db.getDoc('cohorts', String(cohortId));
+      if (!cohortSnap.exists) {
         return res.status(404).json({ error: 'Cohort not found.' });
       }
-      const cohortData = cohortSnap.data();
+      const cohortData = cohortSnap.data() || {};
       if (cohortData.status !== 'active') {
         return res.status(403).json({ error: 'Attendance cannot be submitted to an archived or inactive cohort.' });
       }
@@ -1339,8 +1665,8 @@ export function createApiApp(): Express {
 
       let allowReflections = true;
       try {
-        const settSnap = await getDoc(doc(db, 'schoolSettings', 'school_config'));
-        if (settSnap.exists() && settSnap.data().allowLearnerReflections === false) {
+        const settSnap = await db.getDoc('schoolSettings', 'school_config');
+        if (settSnap.exists && settSnap.data()?.allowLearnerReflections === false) {
           allowReflections = false;
         }
       } catch {
@@ -1348,7 +1674,6 @@ export function createApiApp(): Express {
       }
 
       const docId = `reg_${cohortId}_${authLearner.id}_${targetDate}`;
-      const registerRef = doc(db, 'dailyRegisters', docId);
 
       const payload: any = {
         id: docId,
@@ -1379,10 +1704,10 @@ export function createApiApp(): Express {
         correctionHistory: [],
       };
 
-      const txResult = await runTransaction(db, async (transaction) => {
-        const existingSnap = await transaction.get(registerRef);
-        if (existingSnap.exists()) {
-          const existingData = existingSnap.data();
+      const txResult = await db.runTransaction(async (tx) => {
+        const existingSnap = await tx.get('dailyRegisters', docId);
+        if (existingSnap.exists) {
+          const existingData = existingSnap.data() || {};
           if (!isPreviousDay) {
             return { conflict: existingData, blocked: false, updated: false, saved: null };
           }
@@ -1409,11 +1734,11 @@ export function createApiApp(): Express {
               payload.reflectionTeacherExplain ?? existingData.reflectionTeacherExplain ?? null,
             timestamp: existingData.timestamp || new Date().toISOString(),
           };
-          transaction.set(registerRef, mergedPrevious);
+          tx.set('dailyRegisters', docId, mergedPrevious);
           return { conflict: null, blocked: false, updated: true, saved: mergedPrevious };
         }
 
-        transaction.set(registerRef, payload);
+        tx.set('dailyRegisters', docId, payload);
         return { conflict: null, blocked: false, updated: false, saved: payload };
       });
 
@@ -1459,7 +1784,8 @@ export function createApiApp(): Express {
       });
     } catch (err: any) {
       console.error('Attendance submit error:', err);
-      return res.status(500).json({ error: err.message || 'Failed to submit daily register' });
+      const formatted = formatServerFirestoreError(err, db, 'Failed to submit daily register');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
@@ -1482,14 +1808,14 @@ export function createApiApp(): Express {
         return res.status(503).json({ error: 'Database service unavailable' });
       }
 
-      const [cohortsSnap, learnersSnap] = await Promise.all([
-        getDocs(collection(db, 'cohorts')),
-        getDocs(collection(db, 'learners')),
+      const [cohortsDocs, learnersDocs] = await Promise.all([
+        db.getCollectionDocs('cohorts'),
+        db.getCollectionDocs('learners'),
       ]);
 
       const cohortsById = new Map<string, any>();
       const cohortsByCode = new Map<string, any>();
-      cohortsSnap.docs.forEach((d: any) => {
+      cohortsDocs.forEach((d) => {
         const c = { ...d.data(), id: d.id };
         cohortsById.set(d.id, c);
         if (c.code) cohortsByCode.set(String(c.code).trim().toUpperCase(), c);
@@ -1500,7 +1826,7 @@ export function createApiApp(): Express {
         return res.status(404).json({ error: 'Selected target cohort was not found.' });
       }
 
-      const learnersList = learnersSnap.docs.map((d: any) => ({ ...d.data(), id: d.id }));
+      const learnersList = learnersDocs.map((d) => ({ ...d.data(), id: d.id }));
       const learnersByDigitalId = new Map<string, any>();
       learnersList.forEach((l: any) => {
         const keys = [l.digitalId, l.learnerId, l.username, l.id].filter(Boolean);
@@ -1588,8 +1914,7 @@ export function createApiApp(): Express {
         }
 
         const docId = `reg_${targetCohort.id}_${matchedLearner.id}_${dateStr}`;
-        const registerRef = doc(db, 'dailyRegisters', docId);
-        const existingSnap = await getDoc(registerRef);
+        const existingSnap = await db.getDoc('dailyRegisters', docId);
 
         const learnerDigitalId = matchedLearner.digitalId || matchedLearner.learnerId;
         const validUnderstanding = ['excellent', 'good', 'fair', 'needs_support'].includes(
@@ -1606,14 +1931,14 @@ export function createApiApp(): Express {
           ? String(item.topicTitle).trim().slice(0, 128)
           : cleanSessionLabel || null;
 
-        if (existingSnap.exists()) {
+        if (existingSnap.exists) {
           if (mode === 'skip') {
             skippedCount++;
             skipped.push(`Row ${rowNum}: ${matchedLearner.fullName} (${dateStr}) already exists`);
             continue;
           }
 
-          const existingData = existingSnap.data();
+          const existingData = existingSnap.data() || {};
           const prevHistory = Array.isArray(existingData.correctionHistory) ? existingData.correctionHistory : [];
           const correctionEntry = {
             correctedBy: authTeacher.uid,
@@ -1624,7 +1949,7 @@ export function createApiApp(): Express {
             reason: noteText,
           };
 
-          await updateDoc(registerRef, {
+          await db.updateDoc('dailyRegisters', docId, {
             cohortId: targetCohort.id,
             cohortCode: targetCohort.code || 'COHORT',
             learnerDocId: matchedLearner.id,
@@ -1644,7 +1969,7 @@ export function createApiApp(): Express {
           updatedCount++;
           uploadedDates.add(dateStr);
         } else {
-          await setDoc(registerRef, {
+          await db.setDoc('dailyRegisters', docId, {
             id: docId,
             cohortId: targetCohort.id,
             cohortCode: targetCohort.code || 'COHORT',
@@ -1700,7 +2025,8 @@ export function createApiApp(): Express {
       });
     } catch (err: any) {
       console.error('Historical attendance upload error:', err);
-      return res.status(500).json({ error: err.message || 'Failed to upload historical attendance register' });
+      const formatted = formatServerFirestoreError(err, db, 'Failed to upload historical attendance register');
+      return res.status(formatted.status).json({ error: formatted.message });
     }
   });
 

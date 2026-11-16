@@ -53,7 +53,14 @@ export const LearningProgressView: React.FC<LearningProgressViewProps> = ({
   useEffect(() => {
     let active = true;
     async function loadCerts() {
-      const certs = await getMasteryCertifications();
+      const hasSchoolWideAccess =
+        teacherProfile?.role === 'admin' ||
+        teacherProfile?.role === 'super_admin' ||
+        teacherProfile?.uid === 'teacher_default_staff';
+      const certs = await getMasteryCertifications(
+        undefined,
+        hasSchoolWideAccess ? undefined : cohorts.map((c) => c.id)
+      );
       if (!active) return;
       const setIds = new Set(
         certs.filter((c) => c.certified).map((c) => `${c.cohortId}::${c.learnerId}`)
@@ -64,7 +71,7 @@ export const LearningProgressView: React.FC<LearningProgressViewProps> = ({
     return () => {
       active = false;
     };
-  }, []);
+  }, [cohorts, teacherProfile?.uid, teacherProfile?.role]);
 
   // Current cohort object
   const activeCohort = cohorts.find((c) => c.id === selectedCohortId) || (selectedCohortId !== 'all' ? cohorts[0] : undefined);

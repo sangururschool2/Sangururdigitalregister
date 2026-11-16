@@ -66,31 +66,30 @@ const MainApplication: React.FC = () => {
     setDataLoading(true);
     try {
       await purgeLegacyDemoRecordsIfAdmin();
-      const [cohData, lrData, currData, regData, teacherList] = await Promise.all([
-        getCohorts(),
-        getLearners(),
-        getCurricula(),
-        getDailyRegisters(),
-        getTeachers(),
-      ]);
-
-      const allCohorts = cohData;
-
       const hasSchoolWideAccess =
         teacherProfile.role === 'admin' ||
         teacherProfile.role === 'super_admin' ||
         teacherProfile.uid === 'teacher_default_staff';
-      const scopedCohorts = hasSchoolWideAccess
-        ? allCohorts
-        : allCohorts.filter((c) => c.teacherId === teacherProfile.uid);
 
-      const scopedCohortIds = new Set(scopedCohorts.map((c) => c.id));
+      const [scopedCohorts, lrData, currData, teacherList] = await Promise.all([
+        getCohorts(teacherProfile.uid, hasSchoolWideAccess),
+        getLearners(),
+        getCurricula(),
+        getTeachers(),
+      ]);
+
+      const scopedCohortIds = scopedCohorts.map((c) => c.id);
+      const regData = await getDailyRegisters(
+        hasSchoolWideAccess ? undefined : { cohortIds: scopedCohortIds }
+      );
+
+      const scopedCohortIdSet = new Set(scopedCohortIds);
       const scopedLearners = hasSchoolWideAccess
         ? lrData
-        : lrData.filter((l) => (l.assignedCohortIds || []).some((id) => scopedCohortIds.has(id)));
+        : lrData.filter((l) => (l.assignedCohortIds || []).some((id) => scopedCohortIdSet.has(id)));
       const scopedRegisters = hasSchoolWideAccess
         ? regData
-        : regData.filter((r) => scopedCohortIds.has(r.cohortId));
+        : regData.filter((r) => scopedCohortIdSet.has(r.cohortId));
 
       setCohorts(scopedCohorts);
       setLearners(scopedLearners);

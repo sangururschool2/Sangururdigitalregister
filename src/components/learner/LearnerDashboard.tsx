@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { Cohort, DailyRegister, TeacherFeedback, WeeklyTimetableEntry } from '../../types';
-import { getWeeklyTimetable } from '../../services/dataService';
 import { DailyRegisterModal } from './DailyRegisterModal';
 import { CohortSelectModal } from './CohortSelectModal';
 import { SchoolLogo } from '../common/SchoolLogo';
@@ -124,20 +123,23 @@ export const LearnerDashboard: React.FC<LearnerDashboardProps> = ({
       if (!learnerProfile || !learnerToken || !activeCohort) return;
       setLoading(true);
       try {
-        const [regRes, fbRes, ttEntries] = await Promise.all([
+        const [regRes, fbRes, ttRes] = await Promise.all([
           fetch(`/api/learner/registers?cohortId=${encodeURIComponent(activeCohort.id)}`, {
             headers: { Authorization: `Bearer ${learnerToken}` },
           }),
           fetch('/api/learner/feedback', {
             headers: { Authorization: `Bearer ${learnerToken}` },
           }),
-          getWeeklyTimetable(activeCohort.id).catch(() => [] as WeeklyTimetableEntry[]),
+          fetch(`/api/learner/timetable?cohortId=${encodeURIComponent(activeCohort.id)}`, {
+            headers: { Authorization: `Bearer ${learnerToken}` },
+          }),
         ]);
         const regJson = await regRes.json();
         const fbJson = await fbRes.json();
+        const ttJson = ttRes.ok ? await ttRes.json() : { entries: [] };
         if (regRes.ok) setRegisters(regJson.registers || []);
         if (fbRes.ok) setFeedbackList(fbJson.feedback || []);
-        setTimetableEntries(ttEntries);
+        setTimetableEntries(ttJson.entries || []);
       } catch (err) {
         console.error('Error loading learner dashboard data:', err);
       } finally {

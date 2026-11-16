@@ -22,29 +22,65 @@ service cloud.firestore {
     }
 
     function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'custom'
+      );
     }
 
     function isBootstrappedAdmin() {
-      return isSignedIn() && request.auth.token.email == 'sangururschool10@gmail.com';
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.email == 'sangururschool10@gmail.com';
+    }
+
+    function teacherExists(uid) {
+      return exists(/databases/$(database)/documents/teachers/$(uid));
+    }
+
+    function teacherData(uid) {
+      return get(/databases/$(database)/documents/teachers/$(uid)).data;
     }
 
     function isAdmin() {
       return isBootstrappedAdmin() || (
         isSignedIn() &&
-        exists(/databases/$(database)/documents/teachers/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/teachers/$(request.auth.uid)).data.role in ['admin', 'super_admin']
+        teacherExists(request.auth.uid) &&
+        teacherData(request.auth.uid).active != false &&
+        teacherData(request.auth.uid).role in ['admin', 'super_admin']
       );
     }
 
     function isTeacherOrAdmin() {
       return isAdmin() || (
         isSignedIn() &&
-        exists(/databases/$(database)/documents/teachers/$(request.auth.uid))
+        teacherExists(request.auth.uid) &&
+        teacherData(request.auth.uid).active != false
       );
     }
 
-    // Teachers Collection: Staff directory profiles (no secret credentials stored here)
+    // Staff account created without a Google UID or school admins can manage school-wide cohorts
+    function isStaffWideAccess() {
+      return isAdmin() || (
+        isSignedIn() &&
+        request.auth.uid == 'teacher_default_staff' &&
+        isTeacherOrAdmin()
+      );
+    }
+
+    function isLearnerUser() {
+      return isSignedIn() && exists(/databases/$(database)/documents/learners/$(request.auth.uid));
+    }
+
+    function ownsCohort(cohortId) {
+      return isStaffWideAccess() || (
+        isTeacherOrAdmin() &&
+        exists(/databases/$(database)/documents/cohorts/$(cohortId)) &&
+        get(/databases/$(database)/documents/cohorts/$(cohortId)).data.teacherId == request.auth.uid
+      );
+    }
+
+    // Teachers Collection: Authenticated staff profiles only
     function isValidTeacher(data) {
       return data.keys().hasAll(['uid', 'email', 'fullName', 'role']) &&
              data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 &&
@@ -54,46 +90,32 @@ service cloud.firestore {
     }
 
     match /teachers/{teacherId} {
-      allow get, list: if true;
+      allow get: if isValidId(teacherId) && isSignedIn() && (request.auth.uid == teacherId || isTeacherOrAdmin());
+      allow list: if isSignedIn() && isTeacherOrAdmin();
       allow create: if isValidId(teacherId) &&
+                       isSignedIn() &&
                        isValidTeacher(incoming()) &&
                        (
-                         (isSignedIn() && request.auth.uid == teacherId && (incoming().role == 'teacher' || isBootstrappedAdmin())) ||
-                         (teacherId == 'teacher_default_staff' && incoming().role == 'teacher')
+                         (request.auth.uid == teacherId && (incoming().role == 'teacher' || isBootstrappedAdmin())) ||
+                         isAdmin()
                        );
       allow update: if isValidId(teacherId) &&
+                       isSignedIn() &&
                        isValidTeacher(incoming()) &&
                        incoming().uid == existing().uid &&
                        (
                          isAdmin() ||
-                         (isSignedIn() && request.auth.uid == teacherId && incoming().role == existing().role) ||
-                         (teacherId == 'teacher_default_staff' && incoming().role == existing().role)
+                         (request.auth.uid == teacherId && incoming().role == existing().role)
                        );
       allow delete: if isValidId(teacherId) && isAdmin();
     }
 
-    // Teacher Credentials Collection: Server-mediated PBKDF2-SHA512 salted credentials
-    // Direct get by deterministic ID only (never allow collection listing)
-    function isValidTeacherCredential(data) {
-      return data.keys().hasAll(['username', 'teacherUid', 'passwordHash', 'salt']) &&
-             data.keys().hasOnly(['id', 'username', 'teacherUid', 'passwordHash', 'salt', 'active', 'createdAt', 'updatedAt']) &&
-             data.username is string && data.username.size() > 0 && data.username.size() <= 64 &&
-             data.teacherUid is string && data.teacherUid.size() > 0 && data.teacherUid.size() <= 128 &&
-             data.passwordHash is string && data.passwordHash.size() >= 64 && data.passwordHash.size() <= 256 &&
-             data.salt is string && data.salt.size() >= 16 && data.salt.size() <= 128;
-    }
-
+    // Teacher Credentials Collection: Strictly server-side Admin SDK only (never client-readable)
     match /teacherCredentials/{credId} {
-      allow get: if isValidId(credId);
-      allow list: if false;
-      allow create: if isValidId(credId) && isValidTeacherCredential(incoming());
-      allow update: if isAdmin() && isValidId(credId) && isValidTeacherCredential(incoming());
-      allow delete: if false;
+      allow read, write: if false;
     }
 
-    // Learners Collection
-    // Note: Server backend mediates learner auth & registration using Firestore SDK
-    // until a Firebase Admin Service Account is provisioned for server-to-Firestore calls.
+    // Learners Collection: Authenticated staff + self-read for signed-in learner
     function isValidLearner(data) {
       return data.keys().hasAll(['fullName', 'learnerId', 'username']) &&
              data.fullName is string && data.fullName.size() > 0 && data.fullName.size() <= 128 &&
@@ -104,25 +126,25 @@ service cloud.firestore {
     }
 
     match /learners/{learnerId} {
-      allow get, list: if true;
-      allow create, update: if isValidId(learnerId) && isValidLearner(incoming());
+      allow get: if isValidId(learnerId) && isSignedIn() && (isTeacherOrAdmin() || request.auth.uid == learnerId);
+      allow list: if isSignedIn() && isTeacherOrAdmin();
+      allow create: if isValidId(learnerId) && isSignedIn() && isAdmin() && isValidLearner(incoming());
+      allow update: if isValidId(learnerId) &&
+                       isSignedIn() &&
+                       isValidLearner(incoming()) &&
+                       (
+                         isAdmin() ||
+                         (isTeacherOrAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['assignedCohortIds', 'updatedAt']))
+                       );
       allow delete: if isValidId(learnerId) && isAdmin();
     }
 
-    // Atomic Sequence Counters (for concurrent Digital ID allocation)
-    function isValidCounter(data) {
-      return data.keys().hasAll(['lastSeq']) &&
-             data.lastSeq is number &&
-             data.lastSeq >= 0;
-    }
-
+    // Atomic Sequence Counters: Server-side Admin SDK only
     match /counters/{counterId} {
-      allow get: if isValidId(counterId);
-      allow create, update: if isValidId(counterId) && isValidCounter(incoming());
-      allow delete: if false;
+      allow read, write: if false;
     }
 
-    // Cohorts Collection
+    // Cohorts Collection: Enforces teacher cohort ownership + admin oversight
     function isValidCohort(data) {
       return data.keys().hasAll(['name', 'code', 'programme', 'teacherId', 'status']) &&
              data.name is string && data.name.size() > 0 && data.name.size() <= 128 &&
@@ -134,14 +156,34 @@ service cloud.firestore {
     }
 
     match /cohorts/{cohortId} {
-      allow get, list: if true;
-      allow create: if isValidId(cohortId) && isValidCohort(incoming());
-      allow update: if isValidId(cohortId) && isValidCohort(incoming()) &&
-                       incoming().createdAt == existing().createdAt;
+      allow get: if isValidId(cohortId) && isSignedIn() && (
+        isStaffWideAccess() ||
+        (isTeacherOrAdmin() && resource.data.teacherId == request.auth.uid) ||
+        (isLearnerUser() && (
+          cohortId in get(/databases/$(database)/documents/learners/$(request.auth.uid)).data.assignedCohortIds ||
+          resource.data.code in get(/databases/$(database)/documents/learners/$(request.auth.uid)).data.assignedCohortIds
+        ))
+      );
+      allow list: if isSignedIn() && (
+        isStaffWideAccess() ||
+        (isTeacherOrAdmin() && resource.data.teacherId == request.auth.uid)
+      );
+      allow create: if isValidId(cohortId) &&
+                       isSignedIn() &&
+                       isValidCohort(incoming()) &&
+                       (isAdmin() || (isTeacherOrAdmin() && incoming().teacherId == request.auth.uid));
+      allow update: if isValidId(cohortId) &&
+                       isSignedIn() &&
+                       isValidCohort(incoming()) &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         isStaffWideAccess() ||
+                         (isTeacherOrAdmin() && existing().teacherId == request.auth.uid && incoming().teacherId == existing().teacherId)
+                       );
       allow delete: if isValidId(cohortId) && isAdmin();
     }
 
-    // Cohort Members Collection
+    // Cohort Members Collection: Enforces cohort ownership + learner self-read
     function isValidCohortMember(data) {
       return data.keys().hasAll(['cohortId', 'learnerId']) &&
              data.cohortId is string && data.cohortId.size() > 0 && data.cohortId.size() <= 128 &&
@@ -149,12 +191,21 @@ service cloud.firestore {
     }
 
     match /cohortMembers/{memberId} {
-      allow get, list: if true;
-      allow create, update: if isValidId(memberId) && isValidCohortMember(incoming());
-      allow delete: if isValidId(memberId);
+      allow get, list: if isSignedIn() && (
+        isStaffWideAccess() ||
+        ownsCohort(resource.data.cohortId) ||
+        (isLearnerUser() && resource.data.learnerId == request.auth.uid)
+      );
+      allow create, update: if isValidId(memberId) &&
+                               isSignedIn() &&
+                               isValidCohortMember(incoming()) &&
+                               ownsCohort(incoming().cohortId);
+      allow delete: if isValidId(memberId) &&
+                       isSignedIn() &&
+                       ownsCohort(existing().cohortId);
     }
 
-    // Curricula Collection
+    // Curricula Collection: Readable by authenticated staff & learners; editable by teachers/admins
     function isValidCurriculum(data) {
       return data.keys().hasAll(['title', 'description', 'learningAreas']) &&
              data.title is string && data.title.size() > 0 && data.title.size() <= 128 &&
@@ -163,12 +214,15 @@ service cloud.firestore {
     }
 
     match /curricula/{curriculumId} {
-      allow get, list: if true;
-      allow create, update: if isValidId(curriculumId) && isValidCurriculum(incoming());
+      allow get, list: if isSignedIn() && (isTeacherOrAdmin() || isLearnerUser());
+      allow create, update: if isValidId(curriculumId) &&
+                               isSignedIn() &&
+                               isValidCurriculum(incoming()) &&
+                               isTeacherOrAdmin();
       allow delete: if isValidId(curriculumId) && isAdmin();
     }
 
-    // Daily Registers Collection
+    // Daily Registers Collection: Cohort-owned teacher writes + strict learner self-ownership
     function isValidDailyRegister(data) {
       return data.keys().hasAll(['cohortId', 'learnerDocId', 'date', 'status']) &&
              data.cohortId is string && data.cohortId.size() > 0 && data.cohortId.size() <= 128 &&
@@ -180,13 +234,26 @@ service cloud.firestore {
     }
 
     match /dailyRegisters/{registerId} {
-      allow get, list: if true;
-      allow create: if isValidId(registerId) && isValidDailyRegister(incoming());
-      allow update: if isValidId(registerId) && isValidDailyRegister(incoming());
+      allow get, list: if isSignedIn() && (
+        isStaffWideAccess() ||
+        ownsCohort(resource.data.cohortId) ||
+        (isLearnerUser() && resource.data.learnerDocId == request.auth.uid)
+      );
+      allow create: if isValidId(registerId) &&
+                       isSignedIn() &&
+                       isValidDailyRegister(incoming()) &&
+                       ownsCohort(incoming().cohortId);
+      allow update: if isValidId(registerId) &&
+                       isSignedIn() &&
+                       isValidDailyRegister(incoming()) &&
+                       incoming().cohortId == existing().cohortId &&
+                       incoming().learnerDocId == existing().learnerDocId &&
+                       incoming().date == existing().date &&
+                       ownsCohort(existing().cohortId);
       allow delete: if isValidId(registerId) && isAdmin();
     }
 
-    // Teacher Feedback Collection
+    // Teacher Feedback Collection: Author teacher / learner recipient / admin only
     function isValidTeacherFeedback(data) {
       return data.keys().hasAll(['teacherId', 'learnerDocId', 'message']) &&
              data.teacherId is string && data.teacherId.size() > 0 && data.teacherId.size() <= 128 &&
@@ -195,14 +262,24 @@ service cloud.firestore {
     }
 
     match /teacherFeedback/{feedbackId} {
-      allow get, list: if true;
-      allow create: if isValidId(feedbackId) && isValidTeacherFeedback(incoming()) &&
-                       (!isSignedIn() || isAdmin() || incoming().teacherId == request.auth.uid);
-      allow update: if isValidId(feedbackId) && isValidTeacherFeedback(incoming());
+      allow get, list: if isSignedIn() && (
+        isStaffWideAccess() ||
+        (isTeacherOrAdmin() && resource.data.teacherId == request.auth.uid) ||
+        (isLearnerUser() && resource.data.learnerDocId == request.auth.uid)
+      );
+      allow create: if isValidId(feedbackId) &&
+                       isSignedIn() &&
+                       isValidTeacherFeedback(incoming()) &&
+                       isTeacherOrAdmin() &&
+                       (isAdmin() || incoming().teacherId == request.auth.uid);
+      allow update: if isValidId(feedbackId) &&
+                       isSignedIn() &&
+                       isValidTeacherFeedback(incoming()) &&
+                       (isAdmin() || (isTeacherOrAdmin() && existing().teacherId == request.auth.uid));
       allow delete: if isValidId(feedbackId) && isAdmin();
     }
 
-    // Mastery Certifications Collection
+    // Mastery Certifications Collection: Cohort-owned teacher writes + learner self-read
     function isValidMasteryCert(data) {
       return data.keys().hasAll(['cohortId', 'learnerId', 'certified']) &&
              data.cohortId is string && data.cohortId.size() <= 128 &&
@@ -211,12 +288,19 @@ service cloud.firestore {
     }
 
     match /masteryCertifications/{certId} {
-      allow get, list: if true;
-      allow create, update: if isValidId(certId) && isValidMasteryCert(incoming());
+      allow get, list: if isSignedIn() && (
+        isStaffWideAccess() ||
+        ownsCohort(resource.data.cohortId) ||
+        (isLearnerUser() && resource.data.learnerId == request.auth.uid)
+      );
+      allow create, update: if isValidId(certId) &&
+                               isSignedIn() &&
+                               isValidMasteryCert(incoming()) &&
+                               ownsCohort(incoming().cohortId);
       allow delete: if isValidId(certId) && isAdmin();
     }
 
-    // Audit Logs Collection (Append-only, strictly immutable)
+    // Audit Logs Collection: Append-only for staff/admins, strictly immutable
     function isValidAuditLog(data) {
       return data.keys().hasAll(['actorId', 'action', 'timestamp']) &&
              data.actorId is string && data.actorId.size() > 0 && data.actorId.size() <= 128 &&
@@ -224,12 +308,16 @@ service cloud.firestore {
     }
 
     match /auditLogs/{logId} {
-      allow get, list: if true;
-      allow create: if isValidId(logId) && isValidAuditLog(incoming());
-      allow update, delete: if false; // Strict audit immutability
+      allow get, list: if isSignedIn() && isTeacherOrAdmin();
+      allow create: if isValidId(logId) &&
+                       isSignedIn() &&
+                       isValidAuditLog(incoming()) &&
+                       isTeacherOrAdmin() &&
+                       (isAdmin() || incoming().actorId == request.auth.uid);
+      allow update, delete: if false;
     }
 
-    // School Settings Collection
+    // School Settings Collection: Readable by signed-in users; editable only by admins
     function isValidSchoolSetting(data) {
       return data.keys().hasAll(['schoolName', 'schoolMotto']) &&
              data.schoolName is string && data.schoolName.size() > 0 && data.schoolName.size() <= 128 &&
@@ -237,12 +325,15 @@ service cloud.firestore {
     }
 
     match /schoolSettings/{settingId} {
-      allow get, list: if true;
-      allow create, update: if isValidId(settingId) && isValidSchoolSetting(incoming());
-      allow delete: if isAdmin() && isValidId(settingId);
+      allow get, list: if isSignedIn();
+      allow create, update: if isValidId(settingId) &&
+                               isSignedIn() &&
+                               isValidSchoolSetting(incoming()) &&
+                               isAdmin();
+      allow delete: if isValidId(settingId) && isAdmin();
     }
 
-    // Weekly Timetables Collection
+    // Weekly Timetables Collection: Enforces teacher cohort ownership
     function isValidWeeklyTimetable(data) {
       return data.keys().hasAll(['cohortId', 'programmeTerm', 'weekNumber', 'weekLabel', 'startDate', 'endDate', 'topics']) &&
              data.cohortId is string && data.cohortId.size() > 0 && data.cohortId.size() <= 128 &&
@@ -255,9 +346,17 @@ service cloud.firestore {
     }
 
     match /weeklyTimetables/{entryId} {
-      allow get, list: if true;
-      allow create, update: if isValidId(entryId) && isValidWeeklyTimetable(incoming());
-      allow delete: if isValidId(entryId);
+      allow get, list: if isSignedIn() && (
+        isStaffWideAccess() ||
+        ownsCohort(resource.data.cohortId)
+      );
+      allow create, update: if isValidId(entryId) &&
+                               isSignedIn() &&
+                               isValidWeeklyTimetable(incoming()) &&
+                               ownsCohort(incoming().cohortId);
+      allow delete: if isValidId(entryId) &&
+                       isSignedIn() &&
+                       ownsCohort(existing().cohortId);
     }
   }
 }

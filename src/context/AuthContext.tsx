@@ -6,7 +6,11 @@ import {
   signOut as fbSignOut,
   db,
 } from '../services/firebase';
-import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import {
+  onAuthStateChanged,
+  signInWithCustomToken,
+  User as FirebaseUser,
+} from 'firebase/auth';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { Teacher, Learner, Cohort, UserRole } from '../types';
 
@@ -48,6 +52,21 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+async function readApiJson(response: Response): Promise<any> {
+  const raw = await response.text();
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const isHtml = raw.trim().startsWith('<');
+    throw new Error(
+      isHtml
+        ? `Authentication endpoint returned an unexpected HTML response (HTTP ${response.status}). Ensure Netlify Functions / Express API routes are active.`
+        : `Server returned invalid JSON response (HTTP ${response.status}).`
+    );
+  }
+}
+
 function readStoredLearnerSession(): StoredLearnerSession | null {
   try {
     const raw = localStorage.getItem(LEARNER_SESSION_KEY);
@@ -60,7 +79,6 @@ function readStoredLearnerSession(): StoredLearnerSession | null {
       }
       return parsed as StoredLearnerSession;
     }
-    // Clear legacy unsigned session format
     localStorage.removeItem(LEARNER_SESSION_KEY);
     return null;
   } catch {
@@ -121,7 +139,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
           return;
         }
-        const data = await res.json();
+        const data = await readApiJson(res);
         if (!cancelled && data.learner) {
           const updatedSession: StoredLearnerSession = {
             token: saved.token,
@@ -134,7 +152,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setRole('learner');
         }
       } catch {
-        // Keep token temporarily only if offline, but still verify expiry
         if (!cancelled) {
           setLearnerToken(saved.token);
           setLearnerProfile(saved.learner);
@@ -170,8 +187,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
           return;
         }
-        const data = await res.json();
+        const data = await readApiJson(res);
         if (!cancelled && data.teacher) {
+          if (data.firebaseCustomToken && !auth.currentUser) {
+            signInWithCustomToken(auth, data.firebaseCustomToken).catch(() => {});
+          }
           const updatedSession: StoredTeacherSession = {
             token: saved.token,
             expiresAt: saved.expiresAt,
@@ -197,10 +217,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
-  // Monitor Firebase Auth state for Teachers & Admins
+  // Monitor Firebase Auth state for Google Staff Sign-In (preserving custom-token staff/learner sessions)
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
+        const isGoogleProvider = user.providerData?.some((p) => p.providerId === 'google.com');
+
+        // Custom-token sessions are managed explicitly by loginAsTeacher / loginAsLearner
+        if (!isGoogleProvider) {
+          setFirebaseUser(user);
+          setLoading(false);
+          return;
+        }
+
         setFirebaseUser(user);
         localStorage.removeItem(LEARNER_SESSION_KEY);
         localStorage.removeItem(TEACHER_SESSION_KEY);
@@ -318,9 +347,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       body: JSON.stringify({ username, password }),
     });
 
-    const data = await response.json();
+    const data = await readApiJson(response);
     if (!response.ok) {
-      throw new Error(data.error || 'Failed to authenticate teacher account');
+      throw new Error(data.error || `Failed to authenticate teacher account (HTTP ${response.status})`);
+    }
+
+    if (data.firebaseCustomToken) {
+      try {
+        await signInWithCustomToken(auth, data.firebaseCustomToken);
+      } catch (customErr) {
+        console.warn('Firebase custom token sign-in notice:', customErr);
+      }
     }
 
     const sessionObj: StoredTeacherSession = {
@@ -332,7 +369,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.removeItem(LEARNER_SESSION_KEY);
     setLearnerProfile(null);
     setLearnerToken(null);
-    setFirebaseUser(null);
     setTeacherProfile(data.teacher);
     setTeacherToken(data.token);
     setRole(data.teacher.role || 'teacher');
@@ -347,9 +383,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       body: JSON.stringify({ username, password }),
     });
 
-    const data = await response.json();
+    const data = await readApiJson(response);
     if (!response.ok) {
-      throw new Error(data.error || 'Failed to authenticate');
+      throw new Error(data.error || `Failed to authenticate learner account (HTTP ${response.status})`);
+    }
+
+    if (data.firebaseCustomToken) {
+      try {
+        await signInWithCustomToken(auth, data.firebaseCustomToken);
+      } catch (customErr) {
+        console.warn('Firebase custom token sign-in notice:', customErr);
+      }
     }
 
     const sessionObj: StoredLearnerSession = {
@@ -358,11 +402,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       learner: data.learner,
     };
 
+    localStorage.removeItem(TEACHER_SESSION_KEY);
+    setTeacherProfile(null);
+    setTeacherToken(null);
     setLearnerProfile(data.learner);
     setLearnerToken(data.token);
     setRole('learner');
-    setTeacherProfile(null);
-    setFirebaseUser(null);
     localStorage.setItem(LEARNER_SESSION_KEY, JSON.stringify(sessionObj));
 
     return {
@@ -391,7 +436,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }),
     });
 
-    const data = await res.json();
+    const data = await readApiJson(res);
     if (!res.ok) {
       throw new Error(data.error || 'Could not change password');
     }
@@ -422,7 +467,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         await logout();
         return;
       }
-      const data = await res.json();
+      const data = await readApiJson(res);
       if (data.learner) {
         setLearnerProfile(data.learner);
         const saved = readStoredLearnerSession();

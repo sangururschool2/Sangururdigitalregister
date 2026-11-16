@@ -69,13 +69,20 @@ export async function purgeLegacyDemoRecordsIfAdmin(): Promise<void> {
 }
 
 // ----------------- COHORTS -----------------
-export async function getCohorts(): Promise<Cohort[]> {
+export async function getCohorts(
+  teacherUid?: string,
+  hasSchoolWideAccess: boolean = true
+): Promise<Cohort[]> {
   try {
-    const q = query(collection(db, 'cohorts'), orderBy('createdAt', 'desc'));
+    const q =
+      !hasSchoolWideAccess && teacherUid
+        ? query(collection(db, 'cohorts'), where('teacherId', '==', teacherUid))
+        : query(collection(db, 'cohorts'), orderBy('createdAt', 'desc'));
     const snap = await getDocs(q);
     return snap.docs
       .filter((d) => !LEGACY_DEMO_COHORT_IDS.has(d.id))
-      .map((d) => ({ ...d.data(), id: d.id } as Cohort));
+      .map((d) => ({ ...d.data(), id: d.id } as Cohort))
+      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, 'cohorts');
     return [];
@@ -271,10 +278,41 @@ export async function updateCurriculum(id: string, updates: Partial<Curriculum>)
 // ----------------- DAILY REGISTERS & ATTENDANCE -----------------
 export async function getDailyRegisters(filters?: {
   cohortId?: string;
+  cohortIds?: string[];
   date?: string;
   learnerDocId?: string;
 }): Promise<DailyRegister[]> {
   try {
+    if (filters?.cohortIds && !filters.cohortId) {
+      if (filters.cohortIds.length === 0) {
+        return [];
+      }
+      const perCohort = await Promise.all(
+        filters.cohortIds.map(async (cid) => {
+          let q = query(collection(db, 'dailyRegisters'), where('cohortId', '==', cid));
+          if (filters.date) {
+            q = query(q, where('date', '==', filters.date));
+          }
+          if (filters.learnerDocId) {
+            q = query(q, where('learnerDocId', '==', filters.learnerDocId));
+          }
+          const snap = await getDocs(q);
+          return snap.docs
+            .filter(
+              (d) =>
+                !LEGACY_DEMO_REGISTER_IDS.has(d.id) &&
+                !LEGACY_DEMO_LEARNER_IDS.has(d.data().learnerDocId)
+            )
+            .map((d) => ({ ...d.data(), id: d.id } as DailyRegister));
+        })
+      );
+      const deduped = new Map<string, DailyRegister>();
+      perCohort.flat().forEach((r) => deduped.set(r.id, r));
+      return Array.from(deduped.values()).sort((a, b) =>
+        (b.timestamp || '').localeCompare(a.timestamp || '')
+      );
+    }
+
     let q = query(collection(db, 'dailyRegisters'));
 
     if (filters?.cohortId) {
@@ -434,9 +472,22 @@ export interface MasteryCertification {
   updatedAt: string;
 }
 
-export async function getMasteryCertifications(cohortId?: string): Promise<MasteryCertification[]> {
+export async function getMasteryCertifications(
+  cohortId?: string,
+  cohortIds?: string[]
+): Promise<MasteryCertification[]> {
   try {
     const colRef = collection(db, 'masteryCertifications');
+    if (cohortIds && !cohortId) {
+      if (cohortIds.length === 0) return [];
+      const perCohort = await Promise.all(
+        cohortIds.map(async (cid) => {
+          const snap = await getDocs(query(colRef, where('cohortId', '==', cid)));
+          return snap.docs.map((d) => ({ ...d.data(), id: d.id } as MasteryCertification));
+        })
+      );
+      return perCohort.flat();
+    }
     const q = cohortId ? query(colRef, where('cohortId', '==', cohortId)) : colRef;
     const snap = await getDocs(q);
     return snap.docs.map((d) => ({ ...d.data(), id: d.id } as MasteryCertification));

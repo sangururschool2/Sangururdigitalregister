@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import confetti from 'canvas-confetti';
 import { useAuth } from '../../context/AuthContext';
-import { getSchoolSettings, getWeeklyTimetable } from '../../services/dataService';
 import {
   Cohort,
   Learner,
@@ -71,10 +70,18 @@ export const DailyRegisterModal: React.FC<DailyRegisterModalProps> = ({
   const [allowReflections, setAllowReflections] = useState<boolean>(true);
 
   useEffect(() => {
-    getSchoolSettings()
-      .then((s) => setAllowReflections(s.allowLearnerReflections !== false))
+    if (!learnerToken) return;
+    fetch('/api/learner/settings', {
+      headers: { Authorization: `Bearer ${learnerToken}` },
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (json?.settings) {
+          setAllowReflections(json.settings.allowLearnerReflections !== false);
+        }
+      })
       .catch(() => setAllowReflections(true));
-  }, []);
+  }, [learnerToken]);
 
   // Nairobi local date
   const nairobiToday = new Intl.DateTimeFormat('en-CA', {
@@ -133,12 +140,16 @@ export const DailyRegisterModal: React.FC<DailyRegisterModalProps> = ({
     return null;
   }, [allRegisters, selectedDate, nairobiToday, existingSubmission]);
 
-  // Load weekly timetable entries once per cohort
+  // Load weekly timetable entries once per cohort via authenticated learner API
   useEffect(() => {
+    if (!learnerToken) return;
     let cancelled = false;
-    getWeeklyTimetable(cohort.id)
-      .then((entries) => {
-        if (!cancelled) setTimetableEntries(entries);
+    fetch(`/api/learner/timetable?cohortId=${encodeURIComponent(cohort.id)}`, {
+      headers: { Authorization: `Bearer ${learnerToken}` },
+    })
+      .then((res) => (res.ok ? res.json() : { entries: [] }))
+      .then((json) => {
+        if (!cancelled) setTimetableEntries(json.entries || []);
       })
       .catch(() => {
         if (!cancelled) setTimetableEntries([]);
@@ -146,7 +157,7 @@ export const DailyRegisterModal: React.FC<DailyRegisterModalProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [cohort.id]);
+  }, [cohort.id, learnerToken]);
 
   // Build topic list tailored to selectedDate's timetable week + curriculum snapshot
   useEffect(() => {
