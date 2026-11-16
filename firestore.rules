@@ -1,0 +1,263 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn() && request.auth.token.email == 'sangururschool10@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/teachers/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/teachers/$(request.auth.uid)).data.role in ['admin', 'super_admin']
+      );
+    }
+
+    function isTeacherOrAdmin() {
+      return isAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/teachers/$(request.auth.uid))
+      );
+    }
+
+    // Teachers Collection: Staff directory profiles (no secret credentials stored here)
+    function isValidTeacher(data) {
+      return data.keys().hasAll(['uid', 'email', 'fullName', 'role']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() > 0 && data.email.size() <= 128 &&
+             data.fullName is string && data.fullName.size() > 0 && data.fullName.size() <= 128 &&
+             data.role in ['teacher', 'admin', 'super_admin'];
+    }
+
+    match /teachers/{teacherId} {
+      allow get, list: if true;
+      allow create: if isValidId(teacherId) &&
+                       isValidTeacher(incoming()) &&
+                       (
+                         (isSignedIn() && request.auth.uid == teacherId && (incoming().role == 'teacher' || isBootstrappedAdmin())) ||
+                         (teacherId == 'teacher_default_staff' && incoming().role == 'teacher')
+                       );
+      allow update: if isValidId(teacherId) &&
+                       isValidTeacher(incoming()) &&
+                       incoming().uid == existing().uid &&
+                       (
+                         isAdmin() ||
+                         (isSignedIn() && request.auth.uid == teacherId && incoming().role == existing().role) ||
+                         (teacherId == 'teacher_default_staff' && incoming().role == existing().role)
+                       );
+      allow delete: if isValidId(teacherId) && isAdmin();
+    }
+
+    // Teacher Credentials Collection: Server-mediated PBKDF2-SHA512 salted credentials
+    // Direct get by deterministic ID only (never allow collection listing)
+    function isValidTeacherCredential(data) {
+      return data.keys().hasAll(['username', 'teacherUid', 'passwordHash', 'salt']) &&
+             data.keys().hasOnly(['id', 'username', 'teacherUid', 'passwordHash', 'salt', 'active', 'createdAt', 'updatedAt']) &&
+             data.username is string && data.username.size() > 0 && data.username.size() <= 64 &&
+             data.teacherUid is string && data.teacherUid.size() > 0 && data.teacherUid.size() <= 128 &&
+             data.passwordHash is string && data.passwordHash.size() >= 64 && data.passwordHash.size() <= 256 &&
+             data.salt is string && data.salt.size() >= 16 && data.salt.size() <= 128;
+    }
+
+    match /teacherCredentials/{credId} {
+      allow get: if isValidId(credId);
+      allow list: if false;
+      allow create: if isValidId(credId) && isValidTeacherCredential(incoming());
+      allow update: if isAdmin() && isValidId(credId) && isValidTeacherCredential(incoming());
+      allow delete: if false;
+    }
+
+    // Learners Collection
+    // Note: Server backend mediates learner auth & registration using Firestore SDK
+    // until a Firebase Admin Service Account is provisioned for server-to-Firestore calls.
+    function isValidLearner(data) {
+      return data.keys().hasAll(['fullName', 'learnerId', 'username']) &&
+             data.fullName is string && data.fullName.size() > 0 && data.fullName.size() <= 128 &&
+             data.learnerId is string && data.learnerId.size() > 0 && data.learnerId.size() <= 64 &&
+             data.username is string && data.username.size() > 0 && data.username.size() <= 64 &&
+             (!data.keys().hasAny(['schoolName']) || data.schoolName == null || (data.schoolName is string && data.schoolName.size() <= 128)) &&
+             (!data.keys().hasAny(['grade']) || data.grade == null || (data.grade is string && data.grade.size() <= 64));
+    }
+
+    match /learners/{learnerId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(learnerId) && isValidLearner(incoming());
+      allow delete: if isValidId(learnerId) && isAdmin();
+    }
+
+    // Atomic Sequence Counters (for concurrent Digital ID allocation)
+    function isValidCounter(data) {
+      return data.keys().hasAll(['lastSeq']) &&
+             data.lastSeq is number &&
+             data.lastSeq >= 0;
+    }
+
+    match /counters/{counterId} {
+      allow get: if isValidId(counterId);
+      allow create, update: if isValidId(counterId) && isValidCounter(incoming());
+      allow delete: if false;
+    }
+
+    // Cohorts Collection
+    function isValidCohort(data) {
+      return data.keys().hasAll(['name', 'code', 'programme', 'teacherId', 'status']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 128 &&
+             data.code is string && data.code.size() > 0 && data.code.size() <= 64 &&
+             data.programme is string && data.programme.size() > 0 && data.programme.size() <= 128 &&
+             data.teacherId is string && data.teacherId.size() > 0 && data.teacherId.size() <= 128 &&
+             data.status in ['active', 'archived', 'draft'] &&
+             (!data.keys().hasAny(['ageBracket']) || data.ageBracket == null || (data.ageBracket is string && data.ageBracket.size() <= 64));
+    }
+
+    match /cohorts/{cohortId} {
+      allow get, list: if true;
+      allow create: if isValidId(cohortId) && isValidCohort(incoming());
+      allow update: if isValidId(cohortId) && isValidCohort(incoming()) &&
+                       incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(cohortId) && isAdmin();
+    }
+
+    // Cohort Members Collection
+    function isValidCohortMember(data) {
+      return data.keys().hasAll(['cohortId', 'learnerId']) &&
+             data.cohortId is string && data.cohortId.size() > 0 && data.cohortId.size() <= 128 &&
+             data.learnerId is string && data.learnerId.size() > 0 && data.learnerId.size() <= 128;
+    }
+
+    match /cohortMembers/{memberId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(memberId) && isValidCohortMember(incoming());
+      allow delete: if isValidId(memberId);
+    }
+
+    // Curricula Collection
+    function isValidCurriculum(data) {
+      return data.keys().hasAll(['title', 'description', 'learningAreas']) &&
+             data.title is string && data.title.size() > 0 && data.title.size() <= 128 &&
+             data.description is string && data.description.size() <= 2048 &&
+             data.learningAreas is list;
+    }
+
+    match /curricula/{curriculumId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(curriculumId) && isValidCurriculum(incoming());
+      allow delete: if isValidId(curriculumId) && isAdmin();
+    }
+
+    // Daily Registers Collection
+    function isValidDailyRegister(data) {
+      return data.keys().hasAll(['cohortId', 'learnerDocId', 'date', 'status']) &&
+             data.cohortId is string && data.cohortId.size() > 0 && data.cohortId.size() <= 128 &&
+             data.learnerDocId is string && data.learnerDocId.size() > 0 && data.learnerDocId.size() <= 128 &&
+             data.date is string && data.date.size() == 10 &&
+             data.status in ['present', 'late', 'absent', 'excused'] &&
+             (!data.keys().hasAny(['didStudy']) || data.didStudy == null || data.didStudy is bool) &&
+             (!data.keys().hasAny(['nonStudyReason']) || data.nonStudyReason == null || (data.nonStudyReason is string && data.nonStudyReason.size() <= 256));
+    }
+
+    match /dailyRegisters/{registerId} {
+      allow get, list: if true;
+      allow create: if isValidId(registerId) && isValidDailyRegister(incoming());
+      allow update: if isValidId(registerId) && isValidDailyRegister(incoming());
+      allow delete: if isValidId(registerId) && isAdmin();
+    }
+
+    // Teacher Feedback Collection
+    function isValidTeacherFeedback(data) {
+      return data.keys().hasAll(['teacherId', 'learnerDocId', 'message']) &&
+             data.teacherId is string && data.teacherId.size() > 0 && data.teacherId.size() <= 128 &&
+             data.learnerDocId is string && data.learnerDocId.size() > 0 && data.learnerDocId.size() <= 128 &&
+             data.message is string && data.message.size() > 0 && data.message.size() <= 2048;
+    }
+
+    match /teacherFeedback/{feedbackId} {
+      allow get, list: if true;
+      allow create: if isValidId(feedbackId) && isValidTeacherFeedback(incoming()) &&
+                       (!isSignedIn() || isAdmin() || incoming().teacherId == request.auth.uid);
+      allow update: if isValidId(feedbackId) && isValidTeacherFeedback(incoming());
+      allow delete: if isValidId(feedbackId) && isAdmin();
+    }
+
+    // Mastery Certifications Collection
+    function isValidMasteryCert(data) {
+      return data.keys().hasAll(['cohortId', 'learnerId', 'certified']) &&
+             data.cohortId is string && data.cohortId.size() <= 128 &&
+             data.learnerId is string && data.learnerId.size() <= 128 &&
+             data.certified is bool;
+    }
+
+    match /masteryCertifications/{certId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(certId) && isValidMasteryCert(incoming());
+      allow delete: if isValidId(certId) && isAdmin();
+    }
+
+    // Audit Logs Collection (Append-only, strictly immutable)
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['actorId', 'action', 'timestamp']) &&
+             data.actorId is string && data.actorId.size() > 0 && data.actorId.size() <= 128 &&
+             data.action is string && data.action.size() > 0 && data.action.size() <= 128;
+    }
+
+    match /auditLogs/{logId} {
+      allow get, list: if true;
+      allow create: if isValidId(logId) && isValidAuditLog(incoming());
+      allow update, delete: if false; // Strict audit immutability
+    }
+
+    // School Settings Collection
+    function isValidSchoolSetting(data) {
+      return data.keys().hasAll(['schoolName', 'schoolMotto']) &&
+             data.schoolName is string && data.schoolName.size() > 0 && data.schoolName.size() <= 128 &&
+             data.schoolMotto is string && data.schoolMotto.size() > 0 && data.schoolMotto.size() <= 128;
+    }
+
+    match /schoolSettings/{settingId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(settingId) && isValidSchoolSetting(incoming());
+      allow delete: if isAdmin() && isValidId(settingId);
+    }
+
+    // Weekly Timetables Collection
+    function isValidWeeklyTimetable(data) {
+      return data.keys().hasAll(['cohortId', 'programmeTerm', 'weekNumber', 'weekLabel', 'startDate', 'endDate', 'topics']) &&
+             data.cohortId is string && data.cohortId.size() > 0 && data.cohortId.size() <= 128 &&
+             data.programmeTerm is string && data.programmeTerm.size() > 0 && data.programmeTerm.size() <= 128 &&
+             data.weekNumber is number && data.weekNumber >= 1 && data.weekNumber <= 52 &&
+             data.weekLabel is string && data.weekLabel.size() > 0 && data.weekLabel.size() <= 128 &&
+             data.startDate is string && data.startDate.size() == 10 &&
+             data.endDate is string && data.endDate.size() == 10 &&
+             data.topics is list && data.topics.size() <= 50;
+    }
+
+    match /weeklyTimetables/{entryId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(entryId) && isValidWeeklyTimetable(incoming());
+      allow delete: if isValidId(entryId);
+    }
+  }
+}
