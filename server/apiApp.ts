@@ -1816,7 +1816,7 @@ export function createApiApp(): Express {
       const cohortsById = new Map<string, any>();
       const cohortsByCode = new Map<string, any>();
       cohortsDocs.forEach((d) => {
-        const c = { ...d.data(), id: d.id };
+        const c: Record<string, any> = { ...d.data(), id: d.id };
         cohortsById.set(d.id, c);
         if (c.code) cohortsByCode.set(String(c.code).trim().toUpperCase(), c);
       });

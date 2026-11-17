@@ -8,6 +8,7 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+  external_node_modules = ["firebase-admin", "express", "serverless-http", "firebase", "dotenv"]
   included_files = ["firebase-applet-config.json"]
 
 # Route all API requests to the Netlify Express serverless function before SPA fallback

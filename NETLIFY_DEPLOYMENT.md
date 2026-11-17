@@ -67,6 +67,7 @@ In Netlify Dashboard go to **Site configuration** -> **Environment variables** -
 | Variable | Description | Required? |
 |---|---|---|
 | `SESSION_SECRET` | Strong random 32+ character hex secret (`openssl rand -hex 32`) for HMAC-SHA256 teacher/learner session tokens across serverless cold starts | **Yes (Required in Production)** |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | Single-line JSON credentials from Firebase Console -> Project settings (`clever-hangar-wwpgt`) -> Service accounts -> Generate new private key (used by `firebase-admin` in Netlify Functions) | **Yes (Required under Hardened Rules)** |
 | `DEFAULT_TEACHER_PASSWORD` | Password used only when bootstrapping `teacherCredentials/teacher_default_staff` if it does not yet exist | Recommended |
 | `APP_URL` | Full HTTPS URL of your deployed Netlify site | Optional |
 
@@ -90,10 +91,11 @@ After Netlify assigns your site domain (and after adding any custom domain):
 ## 6. Production Firebase Setup Checklist
 
 1. **Named Firestore Database:** Ensure the app connects to `ai-studio-sangururdigitall-ec614d5a-13b5-4863-bd7d-92f4cb3d80e1` (already configured in `VITE_FIREBASE_DATABASE_ID` and `firebase-applet-config.json`).
-2. **Firestore Security Rules (`firestore.rules`):** Ensure the latest `firestore.rules` are deployed to Firebase (`firebase deploy --only firestore:rules` or via AI Studio deployment). Do not relax `allow list: if false` on `teacherCredentials` or weaken validation rules.
-3. **Firebase Authentication Providers:** Confirm **Google** sign-in provider is enabled in Firebase Authentication -> Sign-in method.
-4. **No Emulators Active:** Confirm no emulator environment variables or `connectFirestoreEmulator` / `connectAuthEmulator` calls exist (verified clean in SDLR source).
-5. **Initial Admin Account:** Confirm `sangururschool10@gmail.com` or authorized staff Google accounts can sign in cleanly, and rotate default staff/learner passwords after onboarding.
+2. **Firestore Security Rules (`firestore.rules`):** Ensure the latest hardened `firestore.rules` are deployed to Firebase (`firebase deploy --only firestore:rules` or via AI Studio deployment). `teacherCredentials` and `counters` are locked (`allow read, write: if false`) for client SDKs and served exclusively via Firebase Admin SDK.
+3. **Firebase Storage (`storage.rules`):** If your deployment uses file/asset uploads in Firebase Storage (`clever-hangar-wwpgt.firebasestorage.app`), enable Storage in **Firebase Console -> Storage -> Get started** and deploy `storage.rules` (`firebase deploy --only storage`).
+4. **Firebase Authentication Providers:** Confirm **Google** sign-in provider is enabled in Firebase Authentication -> Sign-in method.
+5. **No Emulators Active:** Confirm no emulator environment variables or `connectFirestoreEmulator` / `connectAuthEmulator` calls exist (verified clean in SDLR source).
+6. **Initial Admin Account:** Confirm `sangururschool10@gmail.com` or authorized staff Google accounts can sign in cleanly, and rotate default staff/learner passwords after onboarding.
 
 ---
 
